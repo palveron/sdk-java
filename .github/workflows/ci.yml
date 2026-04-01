@@ -1,0 +1,48 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java-version: ['17', '21']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+      - run: javac -version
+      - name: Compile
+        run: |
+          mkdir -p build
+          javac -d build src/main/java/io/vexis/sdk/Vexis.java
+      - name: Verify
+        run: echo "✅ Compilation successful on Java ${{ matrix.java-version }}"
+
+  # Maven Central publishing requires:
+  # 1. Sonatype OSSRH account (https://central.sonatype.org/)
+  # 2. GPG key for signing
+  # 3. pom.xml (generate from gradle or maven)
+  #
+  # For now, users can:
+  #   - Copy the single Vexis.java file into their project
+  #   - Or use JitPack: implementation 'com.github.disruptivetrends:vexis-sdk-java:v0.4.0'
+  #
+  # JitPack works automatically from GitHub tags — no setup needed.
+  # Add to build.gradle:
+  #   repositories { maven { url 'https://jitpack.io' } }
+  #   dependencies { implementation 'com.github.disruptivetrends:vexis-sdk-java:v0.4.0' }
+  publish-note:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "✅ Tag ${{ github.ref_name }} — available via JitPack immediately"

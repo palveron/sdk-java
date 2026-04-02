@@ -290,26 +290,47 @@ public final class Vexis implements AutoCloseable {
         String state() { return state.get(); }
     }
 
-    // ── Minimal JSON (no external deps) ─────────────────────
+    // ── Minimal JSON (zero dependencies) ────────────────────
 
     static final class SimpleJson {
+
+        /**
+         * Minimal recursive-descent JSON parser. Handles the subset needed for
+         * VEXIS API responses: objects, arrays, strings, numbers, booleans, null.
+         * Zero external dependencies. For high-throughput production use, add
+         * Jackson or Gson to the classpath and swap this implementation.
+         */
         @SuppressWarnings("unchecked")
         static Map<String, Object> parse(String json) {
-            // Minimal JSON parser — for production use, replace with Jackson/Gson
-            // This handles the subset needed for VEXIS API responses
-            try {
-                return (Map<String, Object>) new com.sun.net.httpserver.Headers(); // placeholder
-            } catch (Exception e) {
-                // Fallback: use built-in nashorn or simple parsing
+            if (json == null || json.isBlank()) {
+                return Map.of();
             }
-            // In practice, enterprises will have Jackson on classpath
-            throw new UnsupportedOperationException("Add com.fasterxml.jackson.databind to classpath, or use VexisJackson adapter");
+            var parser = new JsonParser(json.trim());
+            Object result = parser.parseValue();
+            if (result instanceof Map<?, ?> map) {
+                return (Map<String, Object>) map;
+            }
+            return Map.of("value", result);
         }
 
         static String buildVerifyBody(VerifyRequest req) {
             var sb = new StringBuilder("{");
             sb.append("\"prompt\":").append(escapeJson(req.prompt()));
             if (req.extractedText() != null) sb.append(",\"extracted_text\":").append(escapeJson(req.extractedText()));
+            if (req.metadata() != null && !req.metadata().isEmpty()) {
+                sb.append(",\"metadata\":{");
+                var it = req.metadata().entrySet().iterator();
+                while (it.hasNext()) {
+                    var e = it.next();
+                    sb.append(escapeJson(e.getKey())).append(":");
+                    if (e.getValue() instanceof String s) sb.append(escapeJson(s));
+                    else if (e.getValue() instanceof Number n) sb.append(n);
+                    else if (e.getValue() instanceof Boolean b) sb.append(b);
+                    else sb.append(escapeJson(String.valueOf(e.getValue())));
+                    if (it.hasNext()) sb.append(",");
+                }
+                sb.append("}");
+            }
             if (req.attachments() != null && !req.attachments().isEmpty()) {
                 sb.append(",\"attachments\":[");
                 for (int i = 0; i < req.attachments().size(); i++) {
@@ -329,6 +350,134 @@ public final class Vexis implements AutoCloseable {
         private static String escapeJson(String s) {
             if (s == null) return "null";
             return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "\"";
+        }
+
+        // ── Recursive-descent JSON parser ───────────────────
+
+        private static final class JsonParser {
+            private final String input;
+            private int pos;
+
+            JsonParser(String input) { this.input = input; this.pos = 0; }
+
+            Object parseValue() {
+                skipWhitespace();
+                if (pos >= input.length()) return null;
+                char c = input.charAt(pos);
+                return switch (c) {
+                    case '{' -> parseObject();
+                    case '[' -> parseArray();
+                    case '"' -> parseString();
+                    case 't', 'f' -> parseBoolean();
+                    case 'n' -> parseNull();
+                    default -> parseNumber();
+                };
+            }
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> parseObject() {
+                expect('{');
+                var map = new LinkedHashMap<String, Object>();
+                skipWhitespace();
+                if (pos < input.length() && input.charAt(pos) == '}') { pos++; return map; }
+                while (pos < input.length()) {
+                    skipWhitespace();
+                    String key = parseString();
+                    skipWhitespace();
+                    expect(':');
+                    Object value = parseValue();
+                    map.put(key, value);
+                    skipWhitespace();
+                    if (pos < input.length() && input.charAt(pos) == ',') { pos++; continue; }
+                    break;
+                }
+                skipWhitespace();
+                if (pos < input.length() && input.charAt(pos) == '}') pos++;
+                return map;
+            }
+
+            List<Object> parseArray() {
+                expect('[');
+                var list = new ArrayList<>();
+                skipWhitespace();
+                if (pos < input.length() && input.charAt(pos) == ']') { pos++; return list; }
+                while (pos < input.length()) {
+                    list.add(parseValue());
+                    skipWhitespace();
+                    if (pos < input.length() && input.charAt(pos) == ',') { pos++; continue; }
+                    break;
+                }
+                skipWhitespace();
+                if (pos < input.length() && input.charAt(pos) == ']') pos++;
+                return list;
+            }
+
+            String parseString() {
+                expect('"');
+                var sb = new StringBuilder();
+                while (pos < input.length()) {
+                    char c = input.charAt(pos++);
+                    if (c == '"') return sb.toString();
+                    if (c == '\\' && pos < input.length()) {
+                        char esc = input.charAt(pos++);
+                        switch (esc) {
+                            case '"' -> sb.append('"');
+                            case '\\' -> sb.append('\\');
+                            case '/' -> sb.append('/');
+                            case 'n' -> sb.append('\n');
+                            case 'r' -> sb.append('\r');
+                            case 't' -> sb.append('\t');
+                            case 'b' -> sb.append('\b');
+                            case 'f' -> sb.append('\f');
+                            case 'u' -> {
+                                if (pos + 4 <= input.length()) {
+                                    sb.append((char) Integer.parseInt(input.substring(pos, pos + 4), 16));
+                                    pos += 4;
+                                }
+                            }
+                            default -> { sb.append('\\'); sb.append(esc); }
+                        }
+                    } else {
+                        sb.append(c);
+                    }
+                }
+                return sb.toString();
+            }
+
+            Number parseNumber() {
+                int start = pos;
+                if (pos < input.length() && input.charAt(pos) == '-') pos++;
+                while (pos < input.length() && Character.isDigit(input.charAt(pos))) pos++;
+                boolean isFloat = false;
+                if (pos < input.length() && input.charAt(pos) == '.') { isFloat = true; pos++; while (pos < input.length() && Character.isDigit(input.charAt(pos))) pos++; }
+                if (pos < input.length() && (input.charAt(pos) == 'e' || input.charAt(pos) == 'E')) { isFloat = true; pos++; if (pos < input.length() && (input.charAt(pos) == '+' || input.charAt(pos) == '-')) pos++; while (pos < input.length() && Character.isDigit(input.charAt(pos))) pos++; }
+                String numStr = input.substring(start, pos);
+                if (isFloat) return Double.parseDouble(numStr);
+                long val = Long.parseLong(numStr);
+                if (val >= Integer.MIN_VALUE && val <= Integer.MAX_VALUE) return (int) val;
+                return val;
+            }
+
+            Boolean parseBoolean() {
+                if (input.startsWith("true", pos)) { pos += 4; return Boolean.TRUE; }
+                if (input.startsWith("false", pos)) { pos += 5; return Boolean.FALSE; }
+                throw new IllegalStateException("Expected boolean at position " + pos);
+            }
+
+            Object parseNull() {
+                if (input.startsWith("null", pos)) { pos += 4; return null; }
+                throw new IllegalStateException("Expected null at position " + pos);
+            }
+
+            void expect(char c) {
+                skipWhitespace();
+                if (pos < input.length() && input.charAt(pos) == c) { pos++; return; }
+                throw new IllegalStateException("Expected '" + c + "' at position " + pos + " but got '" + (pos < input.length() ? input.charAt(pos) : "EOF") + "'");
+            }
+
+            void skipWhitespace() {
+                while (pos < input.length() && Character.isWhitespace(input.charAt(pos))) pos++;
+            }
         }
     }
 }

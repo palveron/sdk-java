@@ -1,4 +1,4 @@
-package io.vexis.sdk;
+package com.palveron.sdk;
 
 import java.io.IOException;
 import java.net.URI;
@@ -16,10 +16,10 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Official Java SDK for the VEXIS AI Governance Platform.
+ * Official Java SDK for the PALVERON AI Governance Platform.
  *
  * <pre>{@code
- * var client = Vexis.builder("gp_live_xxx")
+ * var client = Palveron.builder("pv_live_xxx")
  *     .baseUrl("https://gateway.acme.corp:8080")
  *     .build();
  *
@@ -31,10 +31,10 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * <p>Thread-safe. Uses Java 17+ HttpClient internally.</p>
  */
-public final class Vexis implements AutoCloseable {
+public final class Palveron implements AutoCloseable {
 
     public static final String VERSION = "0.5.0";
-    private static final String DEFAULT_BASE_URL = "https://gateway.vexis.io";
+    private static final String DEFAULT_BASE_URL = "https://gateway.palveron.com";
 
     private final String apiKey;
     private final String baseUrl;
@@ -44,7 +44,7 @@ public final class Vexis implements AutoCloseable {
     private final Map<String, String> headers;
     private final CircuitBreaker circuit;
 
-    private Vexis(Builder b) {
+    private Palveron(Builder b) {
         this.apiKey = Objects.requireNonNull(b.apiKey, "apiKey is required");
         this.baseUrl = b.baseUrl != null ? b.baseUrl.replaceAll("/+$", "") : DEFAULT_BASE_URL;
         this.timeout = b.timeout != null ? b.timeout : Duration.ofSeconds(30);
@@ -61,7 +61,7 @@ public final class Vexis implements AutoCloseable {
     // ── Core API ────────────────────────────────────────────
 
     /** Send a governance verification request. */
-    public VerifyResponse verify(VerifyRequest request) throws VexisException {
+    public VerifyResponse verify(VerifyRequest request) throws PalveronException {
         long start = System.nanoTime();
         String body = request.toJson();
         Map<String, Object> raw = doRequest("POST", "/api/v1/verify", body);
@@ -70,12 +70,12 @@ public final class Vexis implements AutoCloseable {
     }
 
     /** Quick text-only verification. */
-    public VerifyResponse verify(String prompt) throws VexisException {
+    public VerifyResponse verify(String prompt) throws PalveronException {
         return verify(VerifyRequest.of(prompt));
     }
 
     /** Verify with a file attachment. */
-    public VerifyResponse verifyFile(String prompt, Path filePath) throws VexisException, IOException {
+    public VerifyResponse verifyFile(String prompt, Path filePath) throws PalveronException, IOException {
         byte[] data = Files.readAllBytes(filePath);
         String mime = Files.probeContentType(filePath);
         if (mime == null) mime = "application/octet-stream";
@@ -84,7 +84,7 @@ public final class Vexis implements AutoCloseable {
     }
 
     /** Check gateway health. */
-    public Map<String, Object> health() throws VexisException {
+    public Map<String, Object> health() throws PalveronException {
         return doRequest("GET", "/health", null);
     }
 
@@ -99,15 +99,15 @@ public final class Vexis implements AutoCloseable {
     // ── Internal HTTP ───────────────────────────────────────
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> doRequest(String method, String path, String jsonBody) throws VexisException {
+    private Map<String, Object> doRequest(String method, String path, String jsonBody) throws PalveronException {
         if (!circuit.canRequest()) {
-            throw new VexisException("Circuit breaker open", "CIRCUIT_OPEN", 503, null, false);
+            throw new PalveronException("Circuit breaker open", "CIRCUIT_OPEN", 503, null, false);
         }
 
-        VexisException lastError = null;
+        PalveronException lastError = null;
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             if (attempt > 0) {
-                try { Thread.sleep(backoffMs(attempt)); } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new VexisException("Interrupted", "INTERRUPTED", 0, null, false); }
+                try { Thread.sleep(backoffMs(attempt)); } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new PalveronException("Interrupted", "INTERRUPTED", 0, null, false); }
             }
 
             String requestId = makeRequestId();
@@ -118,7 +118,7 @@ public final class Vexis implements AutoCloseable {
                         .header("Authorization", "Bearer " + apiKey)
                         .header("Content-Type", "application/json")
                         .header("Accept", "application/json")
-                        .header("User-Agent", "vexis-sdk-java/" + VERSION)
+                        .header("User-Agent", "sdk-java/" + VERSION)
                         .header("X-Request-ID", requestId);
 
                 headers.forEach(reqBuilder::header);
@@ -138,31 +138,31 @@ public final class Vexis implements AutoCloseable {
                 }
 
                 switch (resp.statusCode()) {
-                    case 401 -> throw new VexisException("Invalid API key", "AUTH_FAILED", 401, rid, false);
-                    case 429 -> throw new VexisException("Rate limit exceeded", "RATE_LIMITED", 429, rid, true);
+                    case 401 -> throw new PalveronException("Invalid API key", "AUTH_FAILED", 401, rid, false);
+                    case 429 -> throw new PalveronException("Rate limit exceeded", "RATE_LIMITED", 429, rid, true);
                     case 400 -> {
                         Map<String, Object> errBody = SimpleJson.parse(resp.body());
-                        throw new VexisException(String.valueOf(errBody.getOrDefault("error", "Bad request")), "VALIDATION", 400, rid, false);
+                        throw new PalveronException(String.valueOf(errBody.getOrDefault("error", "Bad request")), "VALIDATION", 400, rid, false);
                     }
                 }
 
                 if (resp.statusCode() >= 500) {
                     circuit.onFailure();
-                    lastError = new VexisException("Server error " + resp.statusCode(), "SERVER_ERROR", resp.statusCode(), rid, true);
+                    lastError = new PalveronException("Server error " + resp.statusCode(), "SERVER_ERROR", resp.statusCode(), rid, true);
                     continue;
                 }
 
-                throw new VexisException("HTTP " + resp.statusCode(), "CLIENT_ERROR", resp.statusCode(), rid, false);
+                throw new PalveronException("HTTP " + resp.statusCode(), "CLIENT_ERROR", resp.statusCode(), rid, false);
 
-            } catch (VexisException e) {
+            } catch (PalveronException e) {
                 if (!e.isRetryable()) throw e;
                 lastError = e;
             } catch (IOException | InterruptedException e) {
                 circuit.onFailure();
-                lastError = new VexisException("Network error: " + e.getMessage(), "NETWORK_ERROR", 0, requestId, true);
+                lastError = new PalveronException("Network error: " + e.getMessage(), "NETWORK_ERROR", 0, requestId, true);
             }
         }
-        throw lastError != null ? lastError : new VexisException("Max retries exceeded", "MAX_RETRIES", 0, null, false);
+        throw lastError != null ? lastError : new PalveronException("Max retries exceeded", "MAX_RETRIES", 0, null, false);
     }
 
     private static long backoffMs(int attempt) {
@@ -172,7 +172,7 @@ public final class Vexis implements AutoCloseable {
     }
 
     private static String makeRequestId() {
-        return "vx_" + Long.toHexString(System.currentTimeMillis()) + "_" + Integer.toHexString(ThreadLocalRandom.current().nextInt());
+        return "pv_" + Long.toHexString(System.currentTimeMillis()) + "_" + Integer.toHexString(ThreadLocalRandom.current().nextInt());
     }
 
     // ── Builder ─────────────────────────────────────────────
@@ -192,7 +192,7 @@ public final class Vexis implements AutoCloseable {
         public Builder maxRetries(int n) { this.maxRetries = n; return this; }
         public Builder headers(Map<String, String> h) { this.headers = h; return this; }
         public Builder circuitBreaker(int threshold, Duration cooldown) { this.circuitThreshold = threshold; this.circuitCooldown = cooldown; return this; }
-        public Vexis build() { return new Vexis(this); }
+        public Palveron build() { return new Palveron(this); }
     }
 
     // ── Data Types ──────────────────────────────────────────
@@ -249,13 +249,13 @@ public final class Vexis implements AutoCloseable {
 
     // ── Exception ───────────────────────────────────────────
 
-    public static final class VexisException extends Exception {
+    public static final class PalveronException extends Exception {
         private final String code;
         private final int statusCode;
         private final String requestId;
         private final boolean retryable;
 
-        public VexisException(String message, String code, int statusCode, String requestId, boolean retryable) {
+        public PalveronException(String message, String code, int statusCode, String requestId, boolean retryable) {
             super(message);
             this.code = code;
             this.statusCode = statusCode;
@@ -296,7 +296,7 @@ public final class Vexis implements AutoCloseable {
 
         /**
          * Minimal recursive-descent JSON parser. Handles the subset needed for
-         * VEXIS API responses: objects, arrays, strings, numbers, booleans, null.
+         * PALVERON API responses: objects, arrays, strings, numbers, booleans, null.
          * Zero external dependencies. For high-throughput production use, add
          * Jackson or Gson to the classpath and swap this implementation.
          */

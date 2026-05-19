@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public final class Palveron implements AutoCloseable {
 
-    public static final String VERSION = "0.5.0";
+    public static final String VERSION = "1.1.0";
     private static final String DEFAULT_BASE_URL = "https://gateway.palveron.com";
 
     private final String apiKey;
@@ -60,13 +60,22 @@ public final class Palveron implements AutoCloseable {
 
     // ── Core API ────────────────────────────────────────────
 
-    /** Send a governance verification request. */
+    /**
+     * Send a governance verification request.
+     *
+     * <p>Sprint 87 — the gateway maps the {@code decision} field onto an
+     * HTTP status (200 PASSED / 202 PENDING_APPROVAL / 403 BLOCKED /
+     * 429 RATE_LIMITED). This method treats all four as legitimate
+     * governance outcomes and returns a {@link VerifyResponse} for each
+     * — it does <b>not</b> throw on 403 or 429. Only transport / auth /
+     * 400 / 5xx failures throw {@link PalveronException}.</p>
+     */
     public VerifyResponse verify(VerifyRequest request) throws PalveronException {
         long start = System.nanoTime();
         String body = request.toJson();
-        Map<String, Object> raw = doRequest("POST", "/api/v1/verify", body);
+        HttpOutcome outcome = doRequest("POST", "/api/v1/verify", body, true);
         double latencyMs = (System.nanoTime() - start) / 1_000_000.0;
-        return VerifyResponse.fromMap(raw, latencyMs);
+        return VerifyResponse.fromMap(outcome.body, latencyMs, outcome.status, outcome.retryAfterMs);
     }
 
     /** Quick text-only verification. */
@@ -85,7 +94,7 @@ public final class Palveron implements AutoCloseable {
 
     /** Check gateway health. */
     public Map<String, Object> health() throws PalveronException {
-        return doRequest("GET", "/health", null);
+        return doRequest("GET", "/health", null, false).body;
     }
 
     /** SDK diagnostics. */
@@ -98,8 +107,34 @@ public final class Palveron implements AutoCloseable {
 
     // ── Internal HTTP ───────────────────────────────────────
 
+    /**
+     * Outcome of an HTTP request — the parsed body, the HTTP status that
+     * produced it, and (for 429) the parsed Retry-After in milliseconds.
+     */
+    static final class HttpOutcome {
+        final Map<String, Object> body;
+        final int status;
+        final long retryAfterMs;
+
+        HttpOutcome(Map<String, Object> body, int status, long retryAfterMs) {
+            this.body = body;
+            this.status = status;
+            this.retryAfterMs = retryAfterMs;
+        }
+    }
+
+    /**
+     * Send an HTTP request with retry + circuit-breaker + timeout.
+     *
+     * <p>When {@code expectGovernanceDecision} is true, the Sprint-87
+     * verify-path status codes (202 PENDING_APPROVAL / 403 BLOCKED /
+     * 429 RATE_LIMITED) are returned as governance outcomes instead of
+     * being thrown as {@link PalveronException}. Auth (401), validation
+     * (400), and 5xx remain exceptions because they are not governance
+     * decisions.</p>
+     */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> doRequest(String method, String path, String jsonBody) throws PalveronException {
+    private HttpOutcome doRequest(String method, String path, String jsonBody, boolean expectGovernanceDecision) throws PalveronException {
         if (!circuit.canRequest()) {
             throw new PalveronException("Circuit breaker open", "CIRCUIT_OPEN", 503, null, false);
         }
@@ -134,7 +169,18 @@ public final class Palveron implements AutoCloseable {
 
                 if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
                     circuit.onSuccess();
-                    return SimpleJson.parse(resp.body());
+                    return new HttpOutcome(SimpleJson.parse(resp.body()), resp.statusCode(), 0L);
+                }
+
+                // ── Sprint 87 governance status codes ──
+                // 202 / 403 / 429 carry actionable bodies on the verify
+                // path — surface them as outcomes rather than throwing.
+                if (expectGovernanceDecision && (resp.statusCode() == 202 || resp.statusCode() == 403 || resp.statusCode() == 429)) {
+                    circuit.onSuccess(); // governance decisions are not failures
+                    long retryAfter = resp.statusCode() == 429
+                            ? parseRetryAfterMs(resp.headers().firstValue("Retry-After").orElse(""))
+                            : 0L;
+                    return new HttpOutcome(SimpleJson.parse(resp.body()), resp.statusCode(), retryAfter);
                 }
 
                 switch (resp.statusCode()) {
@@ -163,6 +209,32 @@ public final class Palveron implements AutoCloseable {
             }
         }
         throw lastError != null ? lastError : new PalveronException("Max retries exceeded", "MAX_RETRIES", 0, null, false);
+    }
+
+    /**
+     * Parse an HTTP {@code Retry-After} header into milliseconds. Per RFC
+     * 7231 §7.1.3 the value is either delta-seconds (an integer) or an
+     * HTTP-date — both are supported. Returns 0 when the header is
+     * missing or unparseable so callers can apply their own default.
+     */
+    static long parseRetryAfterMs(String value) {
+        if (value == null || value.isBlank()) return 0L;
+        String trimmed = value.trim();
+        try {
+            double seconds = Double.parseDouble(trimmed);
+            if (seconds >= 0) return (long) (seconds * 1000);
+        } catch (NumberFormatException ignored) {
+            // fall through to HTTP-date parsing
+        }
+        try {
+            Instant when = java.time.ZonedDateTime
+                    .parse(trimmed, java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME)
+                    .toInstant();
+            long delta = when.toEpochMilli() - System.currentTimeMillis();
+            return Math.max(delta, 0L);
+        } catch (Exception ignored) {
+            return 0L;
+        }
     }
 
     private static long backoffMs(int attempt) {
@@ -225,13 +297,50 @@ public final class Palveron implements AutoCloseable {
 
     public record Finding(String risk, String category, String description, double confidence) {}
 
-    public record VerifyResponse(String decision, String output, String reason, String traceId, String integrityHash, boolean shouldAnchor, String flareStatus, String flareTxHash, String contentType, List<Finding> findings, double latencyMs) {
-        public boolean isAllowed() { return "ALLOWED".equals(decision); }
+    /**
+     * Governance verification response.
+     *
+     * <p>Sprint 87 HTTP-status mapping:</p>
+     * <ul>
+     *   <li>{@code PASSED} / {@code ALLOWED} / {@code MODIFIED} /
+     *       {@code FLAGGED} / {@code POLICY_CHANGE} → 200 OK</li>
+     *   <li>{@code PENDING_APPROVAL} → 202 Accepted</li>
+     *   <li>{@code BLOCKED} → 403 Forbidden</li>
+     *   <li>{@code RATE_LIMITED} → 429 Too Many Requests</li>
+     *   <li>{@code ERROR} → transport / internal failure</li>
+     * </ul>
+     *
+     * <p>{@code retryAfterMs} is populated when {@code decision ==
+     * RATE_LIMITED} (parsed from the gateway's Retry-After header).
+     * {@code httpStatus} is the HTTP status that produced the response
+     * — useful for observability.</p>
+     */
+    public record VerifyResponse(
+            String decision,
+            String output,
+            String reason,
+            String traceId,
+            String integrityHash,
+            boolean shouldAnchor,
+            String flareStatus,
+            String flareTxHash,
+            String contentType,
+            List<Finding> findings,
+            double latencyMs,
+            long retryAfterMs,
+            int httpStatus
+    ) {
+        /** @return true if the decision means the request proceeded (ALLOWED or PASSED). */
+        public boolean isAllowed() { return "ALLOWED".equals(decision) || "PASSED".equals(decision); }
+        /** @return true if the decision is BLOCKED. */
         public boolean isBlocked() { return "BLOCKED".equals(decision); }
+        /** @return true if the request is queued for human approval. */
+        public boolean isPendingApproval() { return "PENDING_APPROVAL".equals(decision); }
+        /** @return true if the request was rejected by tier rate-limit. */
+        public boolean isRateLimited() { return "RATE_LIMITED".equals(decision); }
         public boolean hasFindings() { return findings != null && !findings.isEmpty(); }
 
-        @SuppressWarnings("unchecked")
-        static VerifyResponse fromMap(Map<String, Object> m, double latency) {
+        static VerifyResponse fromMap(Map<String, Object> m, double latency, int httpStatus, long retryAfterMs) {
             List<Finding> findings = new ArrayList<>();
             if (m.get("findings") instanceof List<?> fl) {
                 for (Object f : fl) {
@@ -240,8 +349,44 @@ public final class Palveron implements AutoCloseable {
                     }
                 }
             }
-            return new VerifyResponse(str(m, "decision"), str(m, "output"), str(m, "reason"), str(m, "trace_id"), str(m, "integrity_hash"), bool(m, "should_anchor"), str(m, "flare_status"), (String) m.get("flare_tx_hash"), str(m, "content_type"), findings, latency);
+            // Decision precedence: body field > HTTP-status synthesis > ERROR.
+            // 429 responses use the rate-limit error body shape which has
+            // no `decision` field — synthesise one so callers can branch
+            // uniformly on `decision`.
+            String decision = str(m, "decision");
+            if (decision.isEmpty()) {
+                decision = decisionFromStatus(httpStatus);
+            }
+            String reason = str(m, "reason");
+            if (reason.isEmpty()) {
+                reason = str(m, "error");
+            }
+            return new VerifyResponse(
+                    decision,
+                    str(m, "output"),
+                    reason,
+                    str(m, "trace_id"),
+                    str(m, "integrity_hash"),
+                    bool(m, "should_anchor"),
+                    str(m, "flare_status"),
+                    (String) m.get("flare_tx_hash"),
+                    str(m, "content_type"),
+                    findings,
+                    latency,
+                    retryAfterMs,
+                    httpStatus
+            );
         }
+
+        private static String decisionFromStatus(int status) {
+            return switch (status) {
+                case 429 -> "RATE_LIMITED";
+                case 403 -> "BLOCKED";
+                case 202 -> "PENDING_APPROVAL";
+                default -> (status >= 200 && status < 300) ? "PASSED" : "ERROR";
+            };
+        }
+
         private static String str(Map<?, ?> m, String k) { Object v = m.get(k); return v != null ? v.toString() : ""; }
         private static boolean bool(Map<?, ?> m, String k) { Object v = m.get(k); return v instanceof Boolean b && b; }
         private static double num(Map<?, ?> m, String k) { Object v = m.get(k); return v instanceof Number n ? n.doubleValue() : 0; }

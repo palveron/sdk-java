@@ -188,7 +188,8 @@ public final class Palveron implements AutoCloseable {
                     case 429 -> throw new PalveronException("Rate limit exceeded", "RATE_LIMITED", 429, rid, true);
                     case 400 -> {
                         Map<String, Object> errBody = SimpleJson.parse(resp.body());
-                        throw new PalveronException(String.valueOf(errBody.getOrDefault("error", "Bad request")), "VALIDATION", 400, rid, false);
+                        String msg = errorMessage(errBody);
+                        throw new PalveronException(msg.isEmpty() ? "Bad request" : msg, "VALIDATION", 400, rid, false);
                     }
                 }
 
@@ -245,6 +246,25 @@ public final class Palveron implements AutoCloseable {
 
     private static String makeRequestId() {
         return "pv_" + Long.toHexString(System.currentTimeMillis()) + "_" + Integer.toHexString(ThreadLocalRandom.current().nextInt());
+    }
+
+    /**
+     * Extract a human-readable message from a gateway error body, tolerant of
+     * BOTH contract shapes so a caller never sees a Java map rendered as the
+     * message: legacy {@code {"error":"msg"}} (String) and the structured
+     * {@code {"error":{"code","message","request_id"}}} (Map, B1a+). Returns
+     * "" when no usable message is present (caller supplies a default).
+     */
+    private static String errorMessage(Map<String, Object> body) {
+        Object err = body.get("error");
+        if (err instanceof Map<?, ?> m) {
+            Object msg = m.get("message");
+            if (msg instanceof String s) return s;
+        } else if (err instanceof String s) {
+            return s;
+        }
+        Object topMsg = body.get("message");
+        return topMsg instanceof String s ? s : "";
     }
 
     // ── Builder ─────────────────────────────────────────────
